@@ -28,20 +28,15 @@ export default {
 
 		try {
 			const payload: any = await request.json();
-			const title = payload.eventType || "Trawl Notification";
-			const body = payload.message || payload.title || "No message content";
+			const { title, body } = parseNotification(payload);
 
 			const jwt = await generateAPNsJWT(env);
 
-			// --- SMART APNs ROUTING ---
-			// 1. Try Production first
 			let apnsResponse = await sendToAPNs(deviceToken, jwt, env.APP_BUNDLE_ID, title, body, false);
 
-			// 2. If it fails with BadDeviceToken, try Sandbox
 			if (apnsResponse.status === 400) {
 				const errorJson: any = await apnsResponse.clone().json();
 				if (errorJson.reason === "BadDeviceToken") {
-					console.log("Production token failed, trying Sandbox...");
 					apnsResponse = await sendToAPNs(deviceToken, jwt, env.APP_BUNDLE_ID, title, body, true);
 				}
 			}
@@ -58,6 +53,51 @@ export default {
 		}
 	},
 };
+
+function parseNotification(payload: any): { title: string, body: string } {
+	const eventType = payload.eventType || "Notification";
+	let title = eventType;
+	let body = payload.message || "Trawl Update";
+
+	// 1. System Events
+	if (eventType === "Test") return { title: "Trawl Test", body: "Test notification successful! 🚀" };
+	if (eventType === "ApplicationUpdate") return { title: "System Update", body: `Updated to version ${payload.newVersion || "latest"}` };
+	if (eventType === "HealthIssue") return { title: "Health Alert", body: `${payload.level || "Warning"}: ${payload.message}` };
+
+	// 2. Radarr Events
+	if (payload.movie) {
+		const movieTitle = payload.movie.title || "Movie";
+		title = movieTitle;
+
+		switch (eventType) {
+			case "Grab": body = `Grabbed: ${payload.release?.releaseTitle || "New Release"}`; break;
+			case "Download": body = `Download Complete`; break;
+			case "Rename": body = `Files Renamed`; break;
+			case "MovieDelete": body = `Removed from library`; break;
+			case "MovieFileDelete": body = `File deleted: ${payload.movieFile?.relativePath || ""}`; break;
+		}
+	}
+
+	// 3. Sonarr Events
+	if (payload.series) {
+		const seriesTitle = payload.series.title || "Series";
+		title = seriesTitle;
+		const epInfo = payload.episodes?.[0];
+		const epCode = (epInfo?.seasonNumber !== undefined && epInfo?.episodeNumber !== undefined) 
+			? `S${epInfo.seasonNumber}E${epInfo.episodeNumber}` 
+			: "";
+
+		switch (eventType) {
+			case "Grab": body = `Grabbed ${epCode}: ${payload.release?.releaseTitle || "New Release"}`; break;
+			case "Download": body = `Download Complete ${epCode}`; break;
+			case "Rename": body = `Files Renamed`; break;
+			case "SeriesDelete": body = `Removed from library`; break;
+			case "EpisodeFileDelete": body = `Episode deleted: ${epCode}`; break;
+		}
+	}
+
+	return { title, body };
+}
 
 async function sendToAPNs(token: string, jwt: string, bundleId: string, title: string, body: string, isSandbox: boolean) {
 	const domain = isSandbox ? "api.sandbox.push.apple.com" : "api.push.apple.com";
@@ -81,15 +121,10 @@ async function sendToAPNs(token: string, jwt: string, bundleId: string, title: s
 	});
 }
 
-/**
- * Generates a JWT for APNs authentication using Web Crypto API.
- */
 async function generateAPNsJWT(env: Env): Promise<string> {
 	const header = { alg: "ES256", kid: env.APNS_KEY_ID };
 	const now = Math.floor(Date.now() / 1000);
-	const claims = { iss: env.APP_BUNDLE_ID.startsWith("com.poole") ? env.APNS_TEAM_ID : env.APNS_TEAM_ID, iat: now }; 
-    // iss must be the Team ID
-    const jwtClaims = { iss: env.APNS_TEAM_ID, iat: now };
+	const jwtClaims = { iss: env.APNS_TEAM_ID, iat: now };
 
 	const encodedHeader = b64(JSON.stringify(header));
 	const encodedClaims = b64(JSON.stringify(jwtClaims));
