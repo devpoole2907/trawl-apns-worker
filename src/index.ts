@@ -4,11 +4,10 @@
  */
 
 export interface Env {
-	// Secrets
 	APNS_KEY_ID: string;
 	APNS_TEAM_ID: string;
-	APNS_PRIVATE_KEY: string; // The content of the .p8 file
-	APP_BUNDLE_ID: string;    // e.g., com.poole.james.Trawl
+	APNS_PRIVATE_KEY: string;
+	APP_BUNDLE_ID: string;
 }
 
 export default {
@@ -22,52 +21,36 @@ export default {
 			return new Response("Not Found", { status: 404 });
 		}
 
-		// 1. Get Device Token from Header
 		const deviceToken = request.headers.get("X-Trawl-Token");
 		if (!deviceToken) {
 			return new Response("Missing X-Trawl-Token header", { status: 400 });
 		}
 
 		try {
-			// 2. Parse Webhook Payload (Radarr/Sonarr format)
 			const payload: any = await request.json();
-			
-			// Extract title and body based on *arr webhook format
 			const title = payload.eventType || "Trawl Notification";
 			const body = payload.message || payload.title || "No message content";
 
-			// 3. Generate APNs JWT
 			const jwt = await generateAPNsJWT(env);
 
-			// 4. Send to APNs
-			// Note: Use 'api.push.apple.com' for production, 'api.sandbox.push.apple.com' for development
-			const apnsUrl = `https://api.push.apple.com/3/device/${deviceToken}`;
+			// --- SMART APNs ROUTING ---
+			// 1. Try Production first
+			let apnsResponse = await sendToAPNs(deviceToken, jwt, env.APP_BUNDLE_ID, title, body, false);
 
-			const response = await fetch(apnsUrl, {
-				method: "POST",
-				headers: {
-					"authorization": `bearer ${jwt}`,
-					"apns-topic": env.APP_BUNDLE_ID,
-					"apns-push-type": "alert",
-					"apns-priority": "10",
-				},
-				body: JSON.stringify({
-					aps: {
-						alert: {
-							title: title,
-							body: body,
-						},
-						sound: "default",
-						"interruption-level": "time-sensitive"
-					},
-				}),
-			});
+			// 2. If it fails with BadDeviceToken, try Sandbox
+			if (apnsResponse.status === 400) {
+				const errorJson: any = await apnsResponse.clone().json();
+				if (errorJson.reason === "BadDeviceToken") {
+					console.log("Production token failed, trying Sandbox...");
+					apnsResponse = await sendToAPNs(deviceToken, jwt, env.APP_BUNDLE_ID, title, body, true);
+				}
+			}
 
-			if (response.ok) {
+			if (apnsResponse.ok) {
 				return new Response("Notification sent", { status: 200 });
 			} else {
-				const errorText = await response.text();
-				return new Response(`APNs Error: ${errorText}`, { status: response.status });
+				const errorText = await apnsResponse.text();
+				return new Response(`APNs Error: ${errorText}`, { status: apnsResponse.status });
 			}
 
 		} catch (err: any) {
@@ -76,27 +59,42 @@ export default {
 	},
 };
 
+async function sendToAPNs(token: string, jwt: string, bundleId: string, title: string, body: string, isSandbox: boolean) {
+	const domain = isSandbox ? "api.sandbox.push.apple.com" : "api.push.apple.com";
+	const url = `https://${domain}/3/device/${token}`;
+
+	return fetch(url, {
+		method: "POST",
+		headers: {
+			"authorization": `bearer ${jwt}`,
+			"apns-topic": bundleId,
+			"apns-push-type": "alert",
+			"apns-priority": "10",
+		},
+		body: JSON.stringify({
+			aps: {
+				alert: { title, body },
+				sound: "default",
+				"interruption-level": "time-sensitive"
+			},
+		}),
+	});
+}
+
 /**
- * Generates a JWT for APNs authentication.
- * Uses Web Crypto API (supported by Cloudflare Workers).
+ * Generates a JWT for APNs authentication using Web Crypto API.
  */
 async function generateAPNsJWT(env: Env): Promise<string> {
-	const header = {
-		alg: "ES256",
-		kid: env.APNS_KEY_ID,
-	};
-
+	const header = { alg: "ES256", kid: env.APNS_KEY_ID };
 	const now = Math.floor(Date.now() / 1000);
-	const claims = {
-		iss: env.APNS_TEAM_ID,
-		iat: now,
-	};
+	const claims = { iss: env.APP_BUNDLE_ID.startsWith("com.poole") ? env.APNS_TEAM_ID : env.APNS_TEAM_ID, iat: now }; 
+    // iss must be the Team ID
+    const jwtClaims = { iss: env.APNS_TEAM_ID, iat: now };
 
 	const encodedHeader = b64(JSON.stringify(header));
-	const encodedClaims = b64(JSON.stringify(claims));
+	const encodedClaims = b64(JSON.stringify(jwtClaims));
 	const data = `${encodedHeader}.${encodedClaims}`;
 
-	// Import the private key
 	const pem = env.APNS_PRIVATE_KEY
 		.replace(/-----BEGIN PRIVATE KEY-----/, "")
 		.replace(/-----END PRIVATE KEY-----/, "")
@@ -106,10 +104,7 @@ async function generateAPNsJWT(env: Env): Promise<string> {
 	const key = await crypto.subtle.importKey(
 		"pkcs8",
 		binaryKey,
-		{
-			name: "ECDSA",
-			namedCurve: "P-256",
-		},
+		{ name: "ECDSA", namedCurve: "P-256" },
 		false,
 		["sign"]
 	);
