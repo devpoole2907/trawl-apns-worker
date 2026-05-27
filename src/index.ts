@@ -21,9 +21,9 @@ export default {
 			return new Response("Not Found", { status: 404 });
 		}
 
-		const deviceToken = request.headers.get("X-Trawl-Token");
+		const deviceToken = deviceTokenFromRequest(request);
 		if (!deviceToken) {
-			return new Response("Missing X-Trawl-Token header", { status: 400 });
+			return new Response("Missing X-Trawl-Token header or Basic auth password", { status: 400 });
 		}
 
 		try {
@@ -54,7 +54,33 @@ export default {
 	},
 };
 
-function parseNotification(payload: any): { title: string, body: string } {
+export function deviceTokenFromRequest(request: Request): string | null {
+	const headerToken = request.headers.get("X-Trawl-Token")?.trim();
+	if (headerToken) {
+		return headerToken;
+	}
+
+	const authorization = request.headers.get("Authorization")?.trim();
+	if (!authorization?.toLowerCase().startsWith("basic ")) {
+		return null;
+	}
+
+	try {
+		const credentials = atob(authorization.slice("basic ".length).trim());
+		const separatorIndex = credentials.indexOf(":");
+		if (separatorIndex < 0) {
+			return null;
+		}
+
+		const username = credentials.slice(0, separatorIndex).trim().toLowerCase();
+		const password = credentials.slice(separatorIndex + 1).trim();
+		return username === "trawl" && password ? password : null;
+	} catch {
+		return null;
+	}
+}
+
+export function parseNotification(payload: any): { title: string, body: string } {
 	const eventType = payload.eventType || "Notification";
 	let title = eventType;
 	let body = payload.message || "Trawl Update";
