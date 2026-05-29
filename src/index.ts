@@ -1,6 +1,7 @@
 /**
  * trawl-apns-worker
- * A Cloudflare Worker proxy for Apple Push Notification service (APNs).
+ * A Cloudflare Worker proxy for Apple Push Notification service (APNs)
+ * and a caching proxy for the TMDb API.
  */
 
 export interface Env {
@@ -8,51 +9,92 @@ export interface Env {
 	APNS_TEAM_ID: string;
 	APNS_PRIVATE_KEY: string;
 	APP_BUNDLE_ID: string;
+	TMDB_API_KEY: string;
 }
 
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-		if (request.method !== "POST") {
-			return new Response("Method Not Allowed", { status: 405 });
-		}
-
 		const url = new URL(request.url);
-		if (url.pathname !== "/push") {
-			return new Response("Not Found", { status: 404 });
+
+		if (url.pathname.startsWith("/tmdb/")) {
+			return handleTMDb(request, url, env, ctx);
 		}
 
-		const deviceToken = deviceTokenFromRequest(request);
-		if (!deviceToken) {
-			return new Response("Missing X-Trawl-Token header or Basic auth password", { status: 400 });
+		if (url.pathname === "/push") {
+			return handlePush(request, env);
 		}
 
-		try {
-			const payload: any = await request.json();
-			const { title, body } = parseNotification(payload);
-
-			const jwt = await generateAPNsJWT(env);
-
-			let apnsResponse = await sendToAPNs(deviceToken, jwt, env.APP_BUNDLE_ID, title, body, false);
-
-			if (apnsResponse.status === 400) {
-				const errorJson: any = await apnsResponse.clone().json();
-				if (errorJson.reason === "BadDeviceToken") {
-					apnsResponse = await sendToAPNs(deviceToken, jwt, env.APP_BUNDLE_ID, title, body, true);
-				}
-			}
-
-			if (apnsResponse.ok) {
-				return new Response("Notification sent", { status: 200 });
-			} else {
-				const errorText = await apnsResponse.text();
-				return new Response(`APNs Error: ${errorText}`, { status: apnsResponse.status });
-			}
-
-		} catch (err: any) {
-			return new Response(`Server Error: ${err.message}`, { status: 500 });
-		}
+		return new Response("Not Found", { status: 404 });
 	},
 };
+
+async function handleTMDb(request: Request, url: URL, env: Env, ctx: ExecutionContext): Promise<Response> {
+	if (request.method !== "GET") {
+		return new Response("Method Not Allowed", { status: 405 });
+	}
+
+	const cache = caches.default;
+	const cacheKey = new Request(request.url, { method: "GET" });
+	const cached = await cache.match(cacheKey);
+	if (cached) return cached;
+
+	// Strip /tmdb prefix, keep the rest of the path and any query params
+	const tmdbPath = url.pathname.slice("/tmdb".length);
+	const params = new URLSearchParams(url.search);
+	params.set("api_key", env.TMDB_API_KEY);
+
+	const upstream = await fetch(`https://api.themoviedb.org/3${tmdbPath}?${params}`);
+	if (!upstream.ok) {
+		return new Response(await upstream.text(), { status: upstream.status });
+	}
+
+	const response = new Response(upstream.body, {
+		status: 200,
+		headers: {
+			"Content-Type": "application/json",
+			"Cache-Control": "public, max-age=3600",
+		},
+	});
+	ctx.waitUntil(cache.put(cacheKey, response.clone()));
+	return response;
+}
+
+async function handlePush(request: Request, env: Env): Promise<Response> {
+	if (request.method !== "POST") {
+		return new Response("Method Not Allowed", { status: 405 });
+	}
+
+	const deviceToken = deviceTokenFromRequest(request);
+	if (!deviceToken) {
+		return new Response("Missing X-Trawl-Token header or Basic auth password", { status: 400 });
+	}
+
+	try {
+		const payload: any = await request.json();
+		const { title, body } = parseNotification(payload);
+
+		const jwt = await generateAPNsJWT(env);
+
+		let apnsResponse = await sendToAPNs(deviceToken, jwt, env.APP_BUNDLE_ID, title, body, false);
+
+		if (apnsResponse.status === 400) {
+			const errorJson: any = await apnsResponse.clone().json();
+			if (errorJson.reason === "BadDeviceToken") {
+				apnsResponse = await sendToAPNs(deviceToken, jwt, env.APP_BUNDLE_ID, title, body, true);
+			}
+		}
+
+		if (apnsResponse.ok) {
+			return new Response("Notification sent", { status: 200 });
+		} else {
+			const errorText = await apnsResponse.text();
+			return new Response(`APNs Error: ${errorText}`, { status: apnsResponse.status });
+		}
+
+	} catch (err: any) {
+		return new Response(`Server Error: ${err.message}`, { status: 500 });
+	}
+}
 
 export function deviceTokenFromRequest(request: Request): string | null {
 	const headerToken = request.headers.get("X-Trawl-Token")?.trim();
@@ -109,8 +151,8 @@ export function parseNotification(payload: any): { title: string, body: string }
 		const seriesTitle = payload.series.title || "Series";
 		title = seriesTitle;
 		const epInfo = payload.episodes?.[0];
-		const epCode = (epInfo?.seasonNumber !== undefined && epInfo?.episodeNumber !== undefined) 
-			? `S${epInfo.seasonNumber}E${epInfo.episodeNumber}` 
+		const epCode = (epInfo?.seasonNumber !== undefined && epInfo?.episodeNumber !== undefined)
+			? `S${epInfo.seasonNumber}E${epInfo.episodeNumber}`
 			: "";
 
 		switch (eventType) {
@@ -160,7 +202,7 @@ async function generateAPNsJWT(env: Env): Promise<string> {
 		.replace(/-----BEGIN PRIVATE KEY-----/, "")
 		.replace(/-----END PRIVATE KEY-----/, "")
 		.replace(/\s/g, "");
-	
+
 	const binaryKey = str2ab(atob(pem));
 	const key = await crypto.subtle.importKey(
 		"pkcs8",
