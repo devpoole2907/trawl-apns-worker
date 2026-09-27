@@ -36,6 +36,41 @@ Authorization: Basic base64("trawl:<apns-device-token>")
 
 Prowlarr uses Basic auth here because its webhook UI exposes username and password fields, rather than arbitrary custom headers.
 
+## Naming the server a push came from
+
+Trawl also sends the name of the server the webhook belongs to:
+
+```text
+X-Trawl-Source: Radarr 4K
+```
+
+Without it, two servers of the same kind are indistinguishable on the lock screen:
+an HD and a 4K Radarr both push "Download Complete" for the same film, and the
+Arrs' own `instanceName` field is "Radarr" on every install unless the person
+renamed it inside Radarr itself. The header carries the profile name chosen in
+Trawl, so the label always matches what the app calls that server.
+
+The Worker appends it to the body, puts it in `data.source`, and scopes collapse
+ids by it — the two servers number their libraries independently, so movie 12
+exists on both, and an unscoped collapse id let one server's push silently replace
+the other's.
+
+The header is optional. Prowlarr's webhook UI has no custom-header field, so its
+pushes fall back to `instanceName`; a push with neither simply carries no label.
+
+## Duplicate health alerts
+
+One broken indexer is reported by every Arr that syncs from Prowlarr, and each of
+them re-raises it on every recheck — a single failure produced nine banners in one
+morning. Health pushes therefore share a collapse id keyed on the failing check's
+`type` rather than on the server that noticed it, so every report of one fault
+lands on one banner that updates in place. `HealthRestored` shares that key, so
+the all-clear replaces the warning it answers rather than sitting beside it.
+
+Collapsing is presentation only: each repeat still alerts. Suppressing the repeat
+alerts would need the Worker to remember what it has already sent, which it
+deliberately does not do.
+
 ## Payload Handling
 
 The Worker reads the webhook `eventType` and formats a notification title/body before sending to APNs.
@@ -44,7 +79,7 @@ Handled system events:
 
 - `Test`
 - `ApplicationUpdate`
-- `HealthIssue`
+- `Health` / `HealthRestored`
 
 Handled media payloads:
 

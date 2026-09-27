@@ -93,7 +93,7 @@ async function handlePush(request: Request, env: Env): Promise<Response> {
 	}
 
 	try {
-		const notification = parseNotification(payload);
+		const notification = parseNotification(payload, sourceFromRequest(request));
 
 		const jwt = await generateAPNsJWT(env);
 
@@ -142,6 +142,20 @@ export function deviceTokenFromRequest(request: Request): string | null {
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * Which server sent this webhook, as Trawl labelled it when it registered the
+ * webhook — the profile name the person chose in the app ("Radarr 4K"), which is
+ * the only label that separates two instances of the same Arr. The Arrs' own
+ * `instanceName` defaults to "Radarr"/"Sonarr" on every install, so an HD/4K pair
+ * reports the same name unless the person renamed each one inside the Arr itself.
+ *
+ * Prowlarr has no custom-header field in its webhook UI, so its pushes fall back
+ * to `instanceName`; it only sends system events, which carry it.
+ */
+export function sourceFromRequest(request: Request): string | undefined {
+	return field(request.headers.get("X-Trawl-Source"));
 }
 
 /**
@@ -327,12 +341,76 @@ export function parseSeerrNotification(payload: any): ParsedNotification {
 	};
 }
 
-export function parseNotification(payload: any): ParsedNotification {
+/**
+ * Two instances of the same Arr number their libraries independently, so movie 12
+ * on the HD server and movie 12 on the 4K one share an id. Without the source in
+ * the key APNs treats their pushes as one notification, and the second silently
+ * replaces the first on the lock screen.
+ */
+function scopeCollapseId(base: string, source: string | undefined): string {
+	const slug = slugify(source);
+	// apns-collapse-id is capped at 64 bytes; a long server name must not push the
+	// id that identifies the item off the end, so the slug is what gets trimmed.
+	return slug ? `${base}@${slug}`.slice(0, 64) : base;
+}
+
+function slugify(value: string | undefined): string {
+	return value?.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") ?? "";
+}
+
+/**
+ * Health alerts arrive in duplicate two different ways, and both are the same
+ * fact rather than new information:
+ *
+ * - **Over time.** A check stays failed until it is fixed, and each Arr re-raises
+ *   it every time it rechecks — one broken indexer produced six identical
+ *   "Indexers unavailable" banners across two hours.
+ * - **Across servers.** Every Arr that syncs indexers from Prowlarr reports
+ *   Prowlarr's outage as its own, so one failure fires from Radarr, Sonarr and
+ *   Prowlarr within the same second.
+ *
+ * Keying on the failing check rather than on the server that noticed collapses
+ * both into a single banner that updates in place. It is deliberately *not*
+ * scoped by source: merging the servers is the point, and the surviving banner
+ * names whichever reported last. `HealthRestored` shares the key so the all-clear
+ * replaces the warning it answers.
+ *
+ * A user with one service configured is unaffected — there is nothing to merge,
+ * and they still get exactly one banner per fault.
+ */
+function healthCollapseId(payload: any): string | undefined {
+	// Every Arr health payload carries `type` (the check's class name, e.g.
+	// "IndexerStatusCheck"), which is stable across the servers reporting it.
+	const type = slugify(field(payload.type));
+	if (type) return `health-${type}`.slice(0, 64);
+
+	// Without it, fall back to the message. Hashed rather than truncated, because a
+	// 64-byte cut of two long messages that share a prefix would merge two
+	// unrelated faults into one banner.
+	const message = field(payload.message);
+	return message ? `health-${fnv1a(message.toLowerCase())}` : undefined;
+}
+
+/** A short, stable, synchronous digest. `crypto.subtle` is async and overkill here. */
+function fnv1a(value: string): string {
+	let hash = 0x811c9dc5;
+	for (let i = 0; i < value.length; i++) {
+		hash ^= value.charCodeAt(i);
+		hash = Math.imul(hash, 0x01000193) >>> 0;
+	}
+	return hash.toString(36);
+}
+
+export function parseNotification(payload: any, requestSource?: string): ParsedNotification {
 	const eventType = field(payload.eventType) ?? "Notification";
 
 	if (isSeerrEvent(eventType, payload)) {
 		return parseSeerrNotification({ ...payload, eventType });
 	}
+
+	// What Trawl labelled the webhook with wins over what the Arr calls itself,
+	// because it is per-profile and the person picked it. See `sourceFromRequest`.
+	const source = field(requestSource) ?? field(payload.instanceName);
 
 	let title = eventType;
 	let body = field(payload.message) ?? "Trawl Update";
@@ -344,27 +422,43 @@ export function parseNotification(payload: any): ParsedNotification {
 	// 1. System Events
 	if (eventType === "Test") {
 		return {
-			title: "Trawl Test",
+			title: source ? `${source} Test` : "Trawl Test",
 			body: "Test notification successful! 🚀",
-			data,
+			data: source ? { ...data, source } : data,
 			interruptionLevel: "active",
 		};
 	}
 	if (eventType === "ApplicationUpdate") {
 		return {
-			title: "System Update",
+			title: source ? `${source} Update` : "System Update",
 			body: `Updated to version ${field(payload.newVersion) ?? "latest"}`,
-			data,
+			data: source ? { ...data, source } : data,
 			interruptionLevel: "active",
 		};
 	}
-	if (eventType === "HealthIssue") {
+	// The Arrs report this as "Health", not "HealthIssue" — the WebhookEventType
+	// enum they share serializes to the short form.
+	if (eventType === "Health") {
+		const level = field(payload.level) ?? "Warning";
 		return {
-			title: "Health Alert",
-			body: `${field(payload.level) ?? "Warning"}: ${payload.message}`,
-			data: { ...data, style: "error" },
+			title: source ? `${source} Health Alert` : "Health Alert",
+			body: `${level.charAt(0).toUpperCase()}${level.slice(1)}: ${payload.message}`,
+			data: { ...data, style: "error", ...(source ? { source } : {}) },
+			collapseId: healthCollapseId(payload),
 			interruptionLevel: "time-sensitive",
 			style: "error",
+		};
+	}
+	if (eventType === "HealthRestored") {
+		return {
+			title: source ? `${source} Health Restored` : "Health Restored",
+			body: field(payload.message) ?? "All checks are passing again.",
+			data: source ? { ...data, source } : data,
+			// Deliberately the same key as the alert it answers, so the banner that
+			// said "indexer unavailable" is replaced by the all-clear rather than
+			// sitting on the lock screen next to it, stale.
+			collapseId: healthCollapseId(payload),
+			interruptionLevel: "passive",
 		};
 	}
 
@@ -376,7 +470,7 @@ export function parseNotification(payload: any): ParsedNotification {
 		const releaseTitle = field(payload.release?.releaseTitle);
 		if (releaseTitle) data.releaseTitle = releaseTitle;
 		if (payload.movie.tmdbId) data.tmdbId = String(payload.movie.tmdbId);
-		collapseId = payload.movie.id ? `radarr-movie-${payload.movie.id}` : undefined;
+		collapseId = payload.movie.id ? scopeCollapseId(`radarr-movie-${payload.movie.id}`, source) : undefined;
 
 		switch (eventType) {
 			case "Grab": body = `Grabbed: ${releaseTitle ?? "New Release"}`; break;
@@ -394,7 +488,7 @@ export function parseNotification(payload: any): ParsedNotification {
 		data.seriesTitle = seriesTitle;
 		const releaseTitle = field(payload.release?.releaseTitle);
 		if (releaseTitle) data.releaseTitle = releaseTitle;
-		collapseId = payload.series.id ? `sonarr-series-${payload.series.id}` : undefined;
+		collapseId = payload.series.id ? scopeCollapseId(`sonarr-series-${payload.series.id}`, source) : undefined;
 		const epInfo = payload.episodes?.[0];
 		const epCode = (epInfo?.seasonNumber !== undefined && epInfo?.episodeNumber !== undefined)
 			? `S${epInfo.seasonNumber}E${epInfo.episodeNumber}`
@@ -413,6 +507,14 @@ export function parseNotification(payload: any): ParsedNotification {
 
 	if (payload.movie || payload.series) {
 		data.deepLink = "trawl://downloads";
+	}
+
+	// "The Sheep Detectives / Download Complete" is the same banner whichever server
+	// finished it, and a 4K and an HD instance both finish the same film. The source
+	// is what tells the two apart in the notification list.
+	if (source) {
+		data.source = source;
+		body = `${body} · ${source}`;
 	}
 
 	return { title, body, data, collapseId, interruptionLevel, style };
